@@ -128,7 +128,10 @@ async function apiUploadPhoto(playerId, file) {
           body: JSON.stringify({ data: e.target.result, type: file.type }),
           signal: AbortSignal.timeout(30_000),
         })
-        if (!res.ok) throw new Error(res.statusText)
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body.error || res.statusText || `HTTP ${res.status}`)
+        }
         const { url } = await res.json()
         resolve(url)
       } catch (err) {

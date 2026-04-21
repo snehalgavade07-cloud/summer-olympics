@@ -8,18 +8,26 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end()
   if (req.method !== 'POST') return res.status(405).end()
 
-  const { playerId } = req.query
-  const { data, type } = req.body   // base64 data URL + mime type
+  try {
+    const { playerId } = req.query
+    const { data, type } = req.body
 
-  // Strip the data URL prefix and decode to a Buffer
-  const base64 = data.replace(/^data:.+;base64,/, '')
-  const buffer = Buffer.from(base64, 'base64')
+    if (!playerId) return res.status(400).json({ error: 'Missing playerId' })
+    if (!data || !type) return res.status(400).json({ error: 'Missing data or type' })
+    if (!type.startsWith('image/')) return res.status(400).json({ error: 'File must be an image' })
 
-  const ext  = type.split('/')[1] || 'jpg'
-  const blob = await put(`photos/player-${playerId}.${ext}`, buffer, {
-    access: 'public',
-    contentType: type,
-  })
+    const base64 = data.replace(/^data:.+;base64,/, '')
+    const buffer = Buffer.from(base64, 'base64')
 
-  return res.status(200).json({ url: blob.url })
+    const ext = type.split('/')[1] || 'jpg'
+    const blob = await put(`photos/player-${playerId}.${ext}`, buffer, {
+      access: 'public',
+      contentType: type,
+    })
+
+    return res.status(200).json({ url: blob.url })
+  } catch (err) {
+    console.error('[api/upload]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
 }
