@@ -1,0 +1,102 @@
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 3rem 1.5rem;
+  flex: 1;
+}
+
+.hero {
+  text-align: center;
+  padding: 2rem 0 3rem;
+}
+
+.rings {
+  width: 240px;
+  height: auto;
+  margin-bottom: 1.5rem;
+}
+
+.hero h1 {
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  background: linear-gradient(90deg, #FCB131, #EE334E, #0081C8);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  margin-bottom: 0.5rem;
+}
+
+.tagline {
+  color: #cbd5e1;
+  font-size: 1.1rem;
+  min-height: 1.6em;
+}
+
+.section {
+  margin-top: 3rem;
+}
+
+.section h2 {
+  font-size: 1.5rem;
+  margin-bottom: 1rem;
+  color: #f1f5f9;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 1.25rem;
+  backdrop-filter: blur(8px);
+  transition: transform 0.2s, border-color 0.2s;
+}
+
+.card:hover {
+  transform: translateY(-4px);
+  border-color: rgba(252, 177, 49, 0.6);
+}
+
+.year {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #FCB131;
+}
+
+.city {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-top: 0.25rem;
+}
+
+.country {
+  color: #94a3b8;
+  font-size: 0.9rem;
+}
+
+.sports {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.pill {
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  background: rgba(0, 129, 200, 0.2);
+  border: 1px solid rgba(0, 129, 200, 0.4);
+  font-size: 0.9rem;
+  color: #e2e8f0;
+}
+
+.footer {
+  text-align: center;
+  padding: 2rem 0 1rem;
+  color: #64748b;
+}
