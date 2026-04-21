@@ -860,6 +860,13 @@ export default function App() {
                     <span className="muted"> · </span>
                     <span className="fw">{lb?.eventsPlayed??0}</span> <span className="muted">events</span>
                   </div>
+                  {player.facts?.length > 0 && (
+                    <ul className="pc-facts">
+                      {player.facts.map((fact, i) => (
+                        <li key={i}>🎯 {fact}</li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               )
             })}
