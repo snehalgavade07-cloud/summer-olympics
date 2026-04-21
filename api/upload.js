@@ -26,6 +26,7 @@ export default async function handler(req, res) {
     const blob = await put(`photos/player-${playerId}.${ext}`, buffer, {
       access: 'private',
       contentType: type,
+      allowOverwrite: true,
     })
 
     // Return a proxy URL so private blobs can be served without exposing the token
