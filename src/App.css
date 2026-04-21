@@ -1,4 +1,34 @@
 /* ─────────────────────────────────────────────────────────────────────────────
+   LOADING / ERROR SCREEN
+───────────────────────────────────────────────────────────────────────────── */
+
+.fullscreen-center {
+  position: fixed; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 1rem; background: #07070e;
+}
+
+.loading-rings { width: 140px; height: auto; }
+
+@keyframes ringPulse {
+  0%, 100% { opacity: 0.25; }
+  50%       { opacity: 1; }
+}
+
+.loading-text { color: #33334a; font-size: 0.88rem; letter-spacing: 0.1em; }
+
+/* Saving bar */
+.saving-bar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+  background: rgba(245,200,66,0.15);
+  border-bottom: 1px solid rgba(245,200,66,0.25);
+  color: #f5c842; text-align: center;
+  font-size: 0.78rem; font-weight: 600; padding: 0.35rem;
+  letter-spacing: 0.05em;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
    LANDING PAGE
 ───────────────────────────────────────────────────────────────────────────── */
 

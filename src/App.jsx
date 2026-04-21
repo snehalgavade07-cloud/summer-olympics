@@ -1,19 +1,23 @@
 import { useState, useEffect, useRef } from 'react'
+import { doc, onSnapshot, setDoc, updateDoc } from 'firebase/firestore'
+import { ref as storageRef, uploadBytes, getDownloadURL } from 'firebase/storage'
+import { db, storage } from './firebase'
 import './App.css'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TOP_N = 6
+const TOP_N       = 6
 const DEFAULT_PIN = '2026'
+const STATE_REF   = doc(db, 'olympics', 'state')
 
 const PLAYER_EMOJIS = ['😎','🔥','⚡','🌟','💪','🎯','🏆','🦁','🐉']
 
 const INITIAL_PLAYERS = Array.from({ length: 9 }, (_, i) => ({
   id: i + 1,
   name: `Player ${i + 1}`,
-  photo: null,
+  photoUrl: null,
   nickname: '',
   facts: [],
   emoji: PLAYER_EMOJIS[i],
@@ -85,9 +89,9 @@ function posLabel(pos) {
   return '✅ Participated'
 }
 
-function load(key, fallback) {
-  try { return JSON.parse(localStorage.getItem(key)) ?? fallback }
-  catch { return fallback }
+// Write entire state to Firestore
+async function saveState(data) {
+  await updateDoc(STATE_REF, data)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,41 +100,94 @@ function load(key, fallback) {
 
 export default function App() {
 
-  // ── State ────────────────────────────────────────────────────────────────
-  const [screen, setScreen]         = useState('landing') // 'landing' | 'app'
-  const [isAdmin, setIsAdmin]       = useState(false)
-  const [adminPin, setAdminPin]     = useState(() => localStorage.getItem('olympics-pin') || DEFAULT_PIN)
-  const [showPin, setShowPin]       = useState(false)
-  const [pinInput, setPinInput]     = useState('')
-  const [pinError, setPinError]     = useState(false)
+  // ── Meta state ───────────────────────────────────────────────────────────
+  const [screen,   setScreen]   = useState('landing')
+  const [loading,  setLoading]  = useState(true)
+  const [dbError,  setDbError]  = useState(null)
+  const [saving,   setSaving]   = useState(false)
+
+  // ── Admin ────────────────────────────────────────────────────────────────
+  const [isAdmin,     setIsAdmin]     = useState(false)
+  const [adminPin,    setAdminPin]    = useState(DEFAULT_PIN)
+  const [showPin,     setShowPin]     = useState(false)
+  const [pinInput,    setPinInput]    = useState('')
+  const [pinError,    setPinError]    = useState(false)
   const [changingPin, setChangingPin] = useState(false)
-  const [newPin, setNewPin]         = useState('')
+  const [newPin,      setNewPin]      = useState('')
 
-  const [players, setPlayers] = useState(() => load('olympics-players', INITIAL_PLAYERS))
-  const [events,  setEvents]  = useState(() => load('olympics-events',  []))
+  // ── Data (from Firestore) ────────────────────────────────────────────────
+  const [players, setPlayers] = useState(INITIAL_PLAYERS)
+  const [events,  setEvents]  = useState([])
 
+  // ── UI ───────────────────────────────────────────────────────────────────
   const [activeTab,       setActiveTab]       = useState('leaderboard')
   const [selectedEventId, setSelectedEventId] = useState(null)
-  const [drillId,         setDrillId]         = useState(null)   // leaderboard drill-down
-  const [profileId,       setProfileId]       = useState(null)   // player profile modal
+  const [drillId,         setDrillId]         = useState(null)
+  const [profileId,       setProfileId]       = useState(null)
   const [editingPlayerId, setEditingPlayerId] = useState(null)
   const [newFact,         setNewFact]         = useState('')
   const [editNick,        setEditNick]        = useState('')
+  const [uploadingPhoto,  setUploadingPhoto]  = useState(false)
   const photoInputRef = useRef()
 
-  const [form, setForm] = useState(() => ({
-    name: '',
-    date: new Date().toISOString().split('T')[0],
-    category: 'sports',
-    isTeamEvent: false,
+  const [form, setForm] = useState({
+    name: '', date: new Date().toISOString().split('T')[0],
+    category: 'sports', isTeamEvent: false,
     results: Object.fromEntries(INITIAL_PLAYERS.map(p => [p.id, 'absent'])),
-  }))
+  })
 
-  // ── Persistence ──────────────────────────────────────────────────────────
-  useEffect(() => { localStorage.setItem('olympics-players', JSON.stringify(players)) }, [players])
-  useEffect(() => { localStorage.setItem('olympics-events',  JSON.stringify(events))  }, [events])
+  // ─────────────────────────────────────────────────────────────────────────
+  // FIRESTORE — subscribe on mount, migrate localStorage if first time
+  // ─────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const unsub = onSnapshot(STATE_REF,
+      snap => {
+        if (snap.exists()) {
+          const d = snap.data()
+          setPlayers(d.players  ?? INITIAL_PLAYERS)
+          setEvents(d.events    ?? [])
+          setAdminPin(d.adminPin ?? DEFAULT_PIN)
+        } else {
+          // First ever load — migrate from localStorage if data exists, else use defaults
+          const migratedPlayers = (() => {
+            try { return JSON.parse(localStorage.getItem('olympics-players')) || INITIAL_PLAYERS }
+            catch { return INITIAL_PLAYERS }
+          })()
+          const migratedEvents = (() => {
+            try { return JSON.parse(localStorage.getItem('olympics-events')) || [] }
+            catch { return [] }
+          })()
+          const migratedPin = localStorage.getItem('olympics-pin') || DEFAULT_PIN
+
+          setDoc(STATE_REF, {
+            players:  migratedPlayers,
+            events:   migratedEvents,
+            adminPin: migratedPin,
+          })
+        }
+        setLoading(false)
+      },
+      err => {
+        console.error(err)
+        setDbError('Could not connect to database. Check your Firebase rules.')
+        setLoading(false)
+      }
+    )
+    return unsub
+  }, [])
 
   const leaderboard = calcLeaderboard(players, events)
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // HELPERS — all writes go through Firestore
+  // ─────────────────────────────────────────────────────────────────────────
+
+  async function save(patch) {
+    setSaving(true)
+    try { await saveState(patch) }
+    catch (e) { alert('Save failed: ' + e.message) }
+    finally { setSaving(false) }
+  }
 
   // ── Admin ─────────────────────────────────────────────────────────────────
   function handlePinSubmit(e) {
@@ -142,16 +199,17 @@ export default function App() {
     }
   }
 
-  function handleChangePin(e) {
+  async function handleChangePin(e) {
     e.preventDefault()
     if (newPin.length < 4) return
-    localStorage.setItem('olympics-pin', newPin)
+    await save({ adminPin: newPin })
     setAdminPin(newPin); setNewPin(''); setChangingPin(false)
   }
 
   // ── Players ───────────────────────────────────────────────────────────────
-  function updatePlayer(id, changes) {
-    setPlayers(prev => prev.map(p => p.id === id ? { ...p, ...changes } : p))
+  async function updatePlayer(id, changes) {
+    const updated = players.map(p => p.id === id ? { ...p, ...changes } : p)
+    await save({ players: updated })
   }
 
   function openProfile(player) {
@@ -160,12 +218,20 @@ export default function App() {
     setNewFact('')
   }
 
-  function handlePhotoUpload(playerId, e) {
+  async function handlePhotoUpload(playerId, e) {
     const file = e.target.files[0]
     if (!file) return
-    const reader = new FileReader()
-    reader.onload = ev => updatePlayer(playerId, { photo: ev.target.result })
-    reader.readAsDataURL(file)
+    setUploadingPhoto(true)
+    try {
+      const sRef = storageRef(storage, `photos/player-${playerId}`)
+      await uploadBytes(sRef, file)
+      const url = await getDownloadURL(sRef)
+      await updatePlayer(playerId, { photoUrl: url })
+    } catch (err) {
+      alert('Photo upload failed: ' + err.message)
+    } finally {
+      setUploadingPhoto(false)
+    }
   }
 
   // ── Events ────────────────────────────────────────────────────────────────
@@ -177,7 +243,7 @@ export default function App() {
     })
   }
 
-  function handleAddEvent(e) {
+  async function handleAddEvent(e) {
     e.preventDefault()
     if (!form.name.trim()) return
 
@@ -201,20 +267,21 @@ export default function App() {
         position: ['1','2','3'].includes(pos) ? Number(pos) : pos,
       }))
 
-    const ev = {
+    const newEvent = {
       id: Date.now(), name: form.name.trim(),
       date: form.date, category: form.category,
       isTeamEvent: form.isTeamEvent, results,
     }
-    setEvents(prev => [...prev, ev])
+
+    await save({ events: [...events, newEvent] })
     resetForm()
     setActiveTab('events')
-    setSelectedEventId(ev.id)
+    setSelectedEventId(newEvent.id)
   }
 
-  function deleteEvent(id) {
+  async function deleteEvent(id) {
     if (!window.confirm('Delete this event?')) return
-    setEvents(prev => prev.filter(e => e.id !== id))
+    await save({ events: events.filter(e => e.id !== id) })
     if (selectedEventId === id) setSelectedEventId(null)
   }
 
@@ -245,6 +312,33 @@ export default function App() {
   const podiumRanks  = [2, 1, 3]
 
   // ══════════════════════════════════════════════════════════════════════════
+  // LOADING / ERROR
+  // ══════════════════════════════════════════════════════════════════════════
+  if (loading) {
+    return (
+      <div className="fullscreen-center">
+        <svg viewBox="0 0 144 80" className="loading-rings">
+          {RINGS.map((r, i) => (
+            <circle key={i} cx={r.cx} cy={r.cy} r="18"
+              fill="none" stroke={r.color} strokeWidth="4"
+              style={{ animation: `ringPulse 1.4s ease-in-out ${i * 0.2}s infinite` }} />
+          ))}
+        </svg>
+        <p className="loading-text">Connecting…</p>
+      </div>
+    )
+  }
+
+  if (dbError) {
+    return (
+      <div className="fullscreen-center">
+        <p style={{ color: '#f87171', marginBottom: '1rem' }}>⚠️ {dbError}</p>
+        <button className="btn btn--ghost" onClick={() => window.location.reload()}>Retry</button>
+      </div>
+    )
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // LANDING PAGE
   // ══════════════════════════════════════════════════════════════════════════
   if (screen === 'landing') {
@@ -273,6 +367,9 @@ export default function App() {
   return (
     <div className="app">
 
+      {/* Saving indicator */}
+      {saving && <div className="saving-bar">Saving…</div>}
+
       {/* ── PIN MODAL ── */}
       {showPin && (
         <div className="overlay" onClick={() => { setShowPin(false); setPinInput(''); setPinError(false) }}>
@@ -297,8 +394,8 @@ export default function App() {
             <button className="modal-x" onClick={() => setDrillId(null)}>✕</button>
             <div className="drill-header">
               <div className="drill-avatar">
-                {drillPlayer.photo
-                  ? <img src={drillPlayer.photo} alt={drillPlayer.name} />
+                {drillPlayer.photoUrl
+                  ? <img src={drillPlayer.photoUrl} alt={drillPlayer.name} />
                   : <span>{drillPlayer.emoji}</span>}
               </div>
               <div>
@@ -306,7 +403,7 @@ export default function App() {
                 {drillPlayer.nickname && <p className="drill-nick">"{drillPlayer.nickname}"</p>}
                 <p className="drill-meta">
                   {(() => { const r = leaderboard.findIndex(p => p.id === drillId)+1; return r===1?'🥇':r===2?'🥈':r===3?'🥉':`#${r}` })()}
-                  &nbsp;·&nbsp;{drillPlayer.total} pts total
+                  &nbsp;·&nbsp;{drillPlayer.total} pts
                   &nbsp;·&nbsp;{drillPlayer.eventsPlayed} events
                 </p>
               </div>
@@ -332,7 +429,7 @@ export default function App() {
                   </table>
                 </div>
               )}
-            <p className="drill-note">⭐ counts · Best {TOP_N} events are used for total</p>
+            <p className="drill-note">⭐ counts · Best {TOP_N} events used for total</p>
           </div>
         </div>
       )}
@@ -343,18 +440,20 @@ export default function App() {
           <div className="modal modal--wide" onClick={e => e.stopPropagation()}>
             <button className="modal-x" onClick={() => setProfileId(null)}>✕</button>
 
-            {/* Avatar */}
             <div className="profile-avatar-wrap">
               <div className="profile-avatar">
-                {profilePlayer.photo
-                  ? <img src={profilePlayer.photo} alt={profilePlayer.name} />
-                  : <span>{profilePlayer.emoji}</span>}
+                {uploadingPhoto
+                  ? <span className="upload-spinner">⏳</span>
+                  : profilePlayer.photoUrl
+                    ? <img src={profilePlayer.photoUrl} alt={profilePlayer.name} />
+                    : <span>{profilePlayer.emoji}</span>}
               </div>
               {isAdmin && (
                 <>
                   <button className="btn btn--ghost btn--sm"
+                    disabled={uploadingPhoto}
                     onClick={() => photoInputRef.current?.click()}>
-                    {profilePlayer.photo ? '📷 Change' : '📷 Add Photo'}
+                    {uploadingPhoto ? 'Uploading…' : profilePlayer.photoUrl ? '📷 Change' : '📷 Add Photo'}
                   </button>
                   <input ref={photoInputRef} type="file" accept="image/*"
                     style={{ display: 'none' }}
@@ -363,7 +462,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Name + nickname */}
             <div className="profile-name-block">
               <h3 className="profile-name">{profilePlayer.name}</h3>
               {isAdmin ? (
@@ -376,7 +474,6 @@ export default function App() {
               ) : null}
             </div>
 
-            {/* Stats */}
             <div className="profile-stats">
               {[
                 { val: profileRank === 1 ? '🥇' : profileRank === 2 ? '🥈' : profileRank === 3 ? '🥉' : `#${profileRank}`, lbl: 'Rank' },
@@ -390,7 +487,6 @@ export default function App() {
               ))}
             </div>
 
-            {/* Fun facts */}
             <div className="profile-facts">
               <h4>⚡ Fun Facts</h4>
               {(profilePlayer.facts || []).length === 0 && !isAdmin && (
@@ -506,7 +602,6 @@ export default function App() {
               {isAdmin && <button className="btn btn--primary" onClick={() => setActiveTab('add')}>Add First Event</button>}
             </div>
           ) : (<>
-            {/* Podium */}
             <div className="podium">
               {podium.map((player, idx) => {
                 if (!player) return <div key={idx} className="podium-slot" />
@@ -515,8 +610,8 @@ export default function App() {
                     className={`podium-slot podium-slot--${podiumRanks[idx]}`}
                     onClick={() => setDrillId(player.id)}>
                     <div className="podium-avatar">
-                      {player.photo
-                        ? <img src={player.photo} alt={player.name} />
+                      {player.photoUrl
+                        ? <img src={player.photoUrl} alt={player.name} />
                         : <span>{player.emoji}</span>}
                     </div>
                     <div className="podium-medal">{podiumMedals[idx]}</div>
@@ -530,26 +625,21 @@ export default function App() {
               })}
             </div>
 
-            {/* Full table */}
             <div className="table-wrap">
               <table className="score-table">
                 <thead>
-                  <tr>
-                    <th>#</th><th>Player</th><th>Total</th><th>Events</th><th>Top Scores</th>
-                  </tr>
+                  <tr><th>#</th><th>Player</th><th>Total</th><th>Events</th><th>Top Scores</th></tr>
                 </thead>
                 <tbody>
                   {leaderboard.map((p, i) => (
                     <tr key={p.id}
                       className={`row--click ${i < 3 ? 'row--podium' : ''}`}
                       onClick={() => setDrillId(p.id)}>
-                      <td className="cell--rank">
-                        {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : i + 1}
-                      </td>
+                      <td className="cell--rank">{i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : i+1}</td>
                       <td className="cell--name">
                         <div className="tbl-player">
                           <div className="tbl-avatar">
-                            {p.photo ? <img src={p.photo} alt="" /> : <span>{p.emoji}</span>}
+                            {p.photoUrl ? <img src={p.photoUrl} alt="" /> : <span>{p.emoji}</span>}
                           </div>
                           {p.name}
                         </div>
@@ -580,9 +670,7 @@ export default function App() {
         <section className="section">
           <div className="section-hd">
             <h2>Events</h2>
-            {isAdmin && (
-              <button className="btn btn--primary btn--sm" onClick={() => setActiveTab('add')}>➕ Add</button>
-            )}
+            {isAdmin && <button className="btn btn--primary btn--sm" onClick={() => setActiveTab('add')}>➕ Add</button>}
           </div>
           {events.length === 0 ? (
             <div className="empty-state">
@@ -625,8 +713,8 @@ export default function App() {
                                 <td>
                                   <div className="tbl-player">
                                     <div className="tbl-avatar sm">
-                                      {getPlayer(r.playerId)?.photo
-                                        ? <img src={getPlayer(r.playerId).photo} alt="" />
+                                      {getPlayer(r.playerId)?.photoUrl
+                                        ? <img src={getPlayer(r.playerId).photoUrl} alt="" />
                                         : <span>{getPlayer(r.playerId)?.emoji || '👤'}</span>}
                                     </div>
                                     {getName(r.playerId)}
@@ -662,7 +750,6 @@ export default function App() {
         <section className="section">
           <h2>Add New Event</h2>
           <form className="event-form" onSubmit={handleAddEvent}>
-
             <div className="fg">
               <label htmlFor="ev-name">Event Name</label>
               <input id="ev-name" type="text" className="input"
@@ -691,7 +778,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Team toggle */}
             <div className="fg">
               <div className="toggle-row" onClick={() => setForm(p => ({ ...p, isTeamEvent: !p.isTeamEvent }))}>
                 <div className={`toggle ${form.isTeamEvent ? 'toggle--on' : ''}`}>
@@ -706,20 +792,19 @@ export default function App() {
               </div>
             </div>
 
-            {/* Player results */}
             <div className="fg">
               <label>Player Results</label>
               <p className="form-hint">
                 {form.isTeamEvent
-                  ? 'Assign positions to whole teams — multiple players can share a place.'
-                  : 'Only 1 player per podium place. Leave absent if they didn\'t attend.'}
+                  ? 'Assign team positions — multiple players can share a place.'
+                  : 'Only 1 player per podium place.'}
               </p>
               <div className="player-results">
                 {players.map(p => (
                   <div key={p.id} className="pr-row">
                     <div className="pr-info">
                       <div className="pr-avatar">
-                        {p.photo ? <img src={p.photo} alt="" /> : <span>{p.emoji}</span>}
+                        {p.photoUrl ? <img src={p.photoUrl} alt="" /> : <span>{p.emoji}</span>}
                       </div>
                       <span className="pr-name">{p.name}</span>
                     </div>
@@ -738,7 +823,9 @@ export default function App() {
 
             <div className="form-actions">
               <button type="button" className="btn btn--ghost" onClick={resetForm}>Reset</button>
-              <button type="submit" className="btn btn--primary btn--lg">🏅 Save Event</button>
+              <button type="submit" className="btn btn--primary btn--lg" disabled={saving}>
+                {saving ? 'Saving…' : '🏅 Save Event'}
+              </button>
             </div>
           </form>
         </section>
@@ -760,8 +847,8 @@ export default function App() {
               return (
                 <div key={player.id} className="player-card" onClick={() => openProfile(player)}>
                   <div className="pc-photo-wrap">
-                    {player.photo
-                      ? <img src={player.photo} alt={player.name} className="pc-photo" />
+                    {player.photoUrl
+                      ? <img src={player.photoUrl} alt={player.name} className="pc-photo" />
                       : <div className="pc-emoji">{player.emoji}</div>}
                   </div>
                   <div className="pc-rank">
