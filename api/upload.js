@@ -21,11 +21,13 @@ export default async function handler(req, res) {
 
     const ext = type.split('/')[1] || 'jpg'
     const blob = await put(`photos/player-${playerId}.${ext}`, buffer, {
-      access: 'public',
+      access: 'private',
       contentType: type,
     })
 
-    return res.status(200).json({ url: blob.url })
+    // Return a proxy URL so private blobs can be served without exposing the token
+    const proxyUrl = `/api/photo?url=${encodeURIComponent(blob.url)}`
+    return res.status(200).json({ url: proxyUrl })
   } catch (err) {
     console.error('[api/upload]', err.message)
     return res.status(500).json({ error: err.message })
