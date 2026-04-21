@@ -1,9 +1,9 @@
 :root {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   line-height: 1.5;
-  color-scheme: light dark;
-  color: #f5f5f5;
-  background: radial-gradient(circle at 20% 20%, #1e3a8a 0%, #0b1220 60%);
+  color-scheme: dark;
+  color: #ddddf0;
+  background-color: #07070e;
   min-height: 100vh;
 }
 
@@ -15,10 +15,15 @@
 
 body {
   min-height: 100vh;
+  background-color: #07070e;
 }
 
 #root {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+}
+
+input, select, button, textarea {
+  font-family: inherit;
 }
