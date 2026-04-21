@@ -19,6 +19,9 @@ export default async function handler(req, res) {
     const base64 = data.replace(/^data:.+;base64,/, '')
     const buffer = Buffer.from(base64, 'base64')
 
+    if (buffer.length > 3 * 1024 * 1024)
+      return res.status(413).json({ error: 'Image must be under 3 MB' })
+
     const ext = type.split('/')[1] || 'jpg'
     const blob = await put(`photos/player-${playerId}.${ext}`, buffer, {
       access: 'private',

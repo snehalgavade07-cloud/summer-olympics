@@ -266,6 +266,12 @@ export default function App() {
   async function handlePhotoUpload(playerId, e) {
     const file = e.target.files[0]
     if (!file) return
+    // Base64 encoding adds ~33% — keep original under 3 MB to stay within the 4.5 MB body limit
+    if (file.size > 3 * 1024 * 1024) {
+      alert('Image is too large. Please choose a photo under 3 MB.')
+      if (photoInputRef.current) photoInputRef.current.value = ''
+      return
+    }
     setUploadingPhoto(true)
     try {
       const url = await apiUploadPhoto(playerId, file)
