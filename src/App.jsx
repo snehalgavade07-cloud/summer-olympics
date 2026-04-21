@@ -1,7 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
-import { doc, onSnapshot, setDoc, updateDoc } from 'firebase/firestore'
-import { ref as storageRef, uploadBytes, getDownloadURL } from 'firebase/storage'
-import { db, storage } from './firebase'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -10,16 +7,13 @@ import './App.css'
 
 const TOP_N       = 6
 const DEFAULT_PIN = '2026'
-const STATE_REF   = doc(db, 'olympics', 'state')
+const POLL_MS     = 30_000   // refresh every 30 s so all viewers stay in sync
 
 const PLAYER_EMOJIS = ['😎','🔥','⚡','🌟','💪','🎯','🏆','🦁','🐉']
 
 const INITIAL_PLAYERS = Array.from({ length: 9 }, (_, i) => ({
-  id: i + 1,
-  name: `Player ${i + 1}`,
-  photoUrl: null,
-  nickname: '',
-  facts: [],
+  id: i + 1, name: `Player ${i + 1}`,
+  photoUrl: null, nickname: '', facts: [],
   emoji: PLAYER_EMOJIS[i],
 }))
 
@@ -70,7 +64,6 @@ function calcLeaderboard(players, events) {
         })
         .filter(Boolean)
         .sort((a, b) => b.pts - a.pts)
-
       const topBreakdown = breakdown.slice(0, TOP_N)
       const total = topBreakdown.reduce((s, g) => s + g.pts, 0)
       return { ...player, total, eventsPlayed: breakdown.length, topBreakdown, allBreakdown: breakdown }
@@ -89,9 +82,63 @@ function posLabel(pos) {
   return '✅ Participated'
 }
 
-// Write entire state to Firestore
-async function saveState(data) {
-  await updateDoc(STATE_REF, data)
+// ─────────────────────────────────────────────────────────────────────────────
+// API LAYER  –  thin wrappers around fetch + localStorage fallback for local dev
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LOCAL_KEY = 'olympics-state-v2'
+
+async function apiGet() {
+  try {
+    const res = await fetch('/api/state', { signal: AbortSignal.timeout(4000) })
+    if (!res.ok) throw new Error(res.statusText)
+    return await res.json()
+  } catch {
+    // Fallback: localStorage (works when running plain `npm run dev` locally)
+    try { return JSON.parse(localStorage.getItem(LOCAL_KEY)) ?? null } catch { return null }
+  }
+}
+
+async function apiPost(state) {
+  // Always mirror to localStorage (instant local persistence + dev fallback)
+  localStorage.setItem(LOCAL_KEY, JSON.stringify(state))
+  try {
+    const res = await fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state),
+      signal: AbortSignal.timeout(6000),
+    })
+    if (!res.ok) throw new Error(res.statusText)
+  } catch (err) {
+    // Silently swallow in dev; data is already in localStorage
+    if (import.meta.env.PROD) throw err
+  }
+}
+
+async function apiUploadPhoto(playerId, file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = reject
+    reader.onload = async (e) => {
+      try {
+        const res = await fetch(`/api/upload?playerId=${playerId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: e.target.result, type: file.type }),
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!res.ok) throw new Error(res.statusText)
+        const { url } = await res.json()
+        resolve(url)
+      } catch (err) {
+        // Dev fallback: keep base64 in state (won't work in prod but good enough locally)
+        if (import.meta.env.PROD) reject(err)
+        else resolve(e.target.result)
+      }
+    }
+    reader.readAsDataURL(file)
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,13 +147,13 @@ async function saveState(data) {
 
 export default function App() {
 
-  // ── Meta state ───────────────────────────────────────────────────────────
-  const [screen,   setScreen]   = useState('landing')
-  const [loading,  setLoading]  = useState(true)
-  const [dbError,  setDbError]  = useState(null)
-  const [saving,   setSaving]   = useState(false)
+  // ── Meta ──────────────────────────────────────────────────────────────────
+  const [screen,  setScreen]  = useState('landing')
+  const [loading, setLoading] = useState(true)
+  const [dbError, setDbError] = useState(null)
+  const [saving,  setSaving]  = useState(false)
 
-  // ── Admin ────────────────────────────────────────────────────────────────
+  // ── Admin ─────────────────────────────────────────────────────────────────
   const [isAdmin,     setIsAdmin]     = useState(false)
   const [adminPin,    setAdminPin]    = useState(DEFAULT_PIN)
   const [showPin,     setShowPin]     = useState(false)
@@ -115,11 +162,12 @@ export default function App() {
   const [changingPin, setChangingPin] = useState(false)
   const [newPin,      setNewPin]      = useState('')
 
-  // ── Data (from Firestore) ────────────────────────────────────────────────
+  // ── Data ──────────────────────────────────────────────────────────────────
   const [players, setPlayers] = useState(INITIAL_PLAYERS)
   const [events,  setEvents]  = useState([])
+  const stateRef = useRef({ players: INITIAL_PLAYERS, events: [], adminPin: DEFAULT_PIN })
 
-  // ── UI ───────────────────────────────────────────────────────────────────
+  // ── UI ────────────────────────────────────────────────────────────────────
   const [activeTab,       setActiveTab]       = useState('leaderboard')
   const [selectedEventId, setSelectedEventId] = useState(null)
   const [drillId,         setDrillId]         = useState(null)
@@ -137,59 +185,52 @@ export default function App() {
   })
 
   // ─────────────────────────────────────────────────────────────────────────
-  // FIRESTORE — subscribe on mount, migrate localStorage if first time
+  // LOAD + POLL
   // ─────────────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const unsub = onSnapshot(STATE_REF,
-      snap => {
-        if (snap.exists()) {
-          const d = snap.data()
-          setPlayers(d.players  ?? INITIAL_PLAYERS)
-          setEvents(d.events    ?? [])
-          setAdminPin(d.adminPin ?? DEFAULT_PIN)
-        } else {
-          // First ever load — migrate from localStorage if data exists, else use defaults
-          const migratedPlayers = (() => {
-            try { return JSON.parse(localStorage.getItem('olympics-players')) || INITIAL_PLAYERS }
-            catch { return INITIAL_PLAYERS }
-          })()
-          const migratedEvents = (() => {
-            try { return JSON.parse(localStorage.getItem('olympics-events')) || [] }
-            catch { return [] }
-          })()
-          const migratedPin = localStorage.getItem('olympics-pin') || DEFAULT_PIN
 
-          setDoc(STATE_REF, {
-            players:  migratedPlayers,
-            events:   migratedEvents,
-            adminPin: migratedPin,
-          })
-        }
-        setLoading(false)
-      },
-      err => {
-        console.error(err)
-        setDbError('Could not connect to database. Check your Firebase rules.')
-        setLoading(false)
-      }
-    )
-    return unsub
+  const applyState = useCallback((data) => {
+    if (!data) return
+    const p = data.players  ?? INITIAL_PLAYERS
+    const e = data.events   ?? []
+    const pin = data.adminPin ?? DEFAULT_PIN
+    setPlayers(p); setEvents(e); setAdminPin(pin)
+    stateRef.current = { players: p, events: e, adminPin: pin }
   }, [])
+
+  useEffect(() => {
+    apiGet()
+      .then(data => { applyState(data); setLoading(false) })
+      .catch(() => { setDbError('Could not load data.'); setLoading(false) })
+
+    const id = setInterval(() => {
+      apiGet().then(applyState).catch(() => {})
+    }, POLL_MS)
+    return () => clearInterval(id)
+  }, [applyState])
 
   const leaderboard = calcLeaderboard(players, events)
 
   // ─────────────────────────────────────────────────────────────────────────
-  // HELPERS — all writes go through Firestore
+  // SAVE HELPER  – optimistic update + write to API
   // ─────────────────────────────────────────────────────────────────────────
 
   async function save(patch) {
+    const next = { ...stateRef.current, ...patch }
+    // Optimistic
+    if (patch.players)  setPlayers(patch.players)
+    if (patch.events)   setEvents(patch.events)
+    if (patch.adminPin) setAdminPin(patch.adminPin)
+    stateRef.current = next
     setSaving(true)
-    try { await saveState(patch) }
+    try { await apiPost(next) }
     catch (e) { alert('Save failed: ' + e.message) }
-    finally { setSaving(false) }
+    finally   { setSaving(false) }
   }
 
-  // ── Admin ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // ADMIN
+  // ─────────────────────────────────────────────────────────────────────────
+
   function handlePinSubmit(e) {
     e.preventDefault()
     if (pinInput === adminPin) {
@@ -203,19 +244,20 @@ export default function App() {
     e.preventDefault()
     if (newPin.length < 4) return
     await save({ adminPin: newPin })
-    setAdminPin(newPin); setNewPin(''); setChangingPin(false)
+    setNewPin(''); setChangingPin(false)
   }
 
-  // ── Players ───────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // PLAYERS
+  // ─────────────────────────────────────────────────────────────────────────
+
   async function updatePlayer(id, changes) {
-    const updated = players.map(p => p.id === id ? { ...p, ...changes } : p)
+    const updated = stateRef.current.players.map(p => p.id === id ? { ...p, ...changes } : p)
     await save({ players: updated })
   }
 
   function openProfile(player) {
-    setProfileId(player.id)
-    setEditNick(player.nickname || '')
-    setNewFact('')
+    setProfileId(player.id); setEditNick(player.nickname || ''); setNewFact('')
   }
 
   async function handlePhotoUpload(playerId, e) {
@@ -223,23 +265,25 @@ export default function App() {
     if (!file) return
     setUploadingPhoto(true)
     try {
-      const sRef = storageRef(storage, `photos/player-${playerId}`)
-      await uploadBytes(sRef, file)
-      const url = await getDownloadURL(sRef)
+      const url = await apiUploadPhoto(playerId, file)
       await updatePlayer(playerId, { photoUrl: url })
     } catch (err) {
       alert('Photo upload failed: ' + err.message)
     } finally {
       setUploadingPhoto(false)
+      if (photoInputRef.current) photoInputRef.current.value = ''
     }
   }
 
-  // ── Events ────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+
   function resetForm() {
     setForm({
       name: '', date: new Date().toISOString().split('T')[0],
       category: 'sports', isTeamEvent: false,
-      results: Object.fromEntries(players.map(p => [p.id, 'absent'])),
+      results: Object.fromEntries(stateRef.current.players.map(p => [p.id, 'absent'])),
     })
   }
 
@@ -252,7 +296,7 @@ export default function App() {
       for (const [, pos] of Object.entries(form.results)) {
         if (['1','2','3'].includes(pos)) {
           if (taken[pos]) {
-            alert(`Two players can't share ${pos === '1' ? '1st' : pos === '2' ? '2nd' : '3rd'} in a solo event. Enable "Team Event" for group games.`)
+            alert(`Two players can't share ${pos==='1'?'1st':pos==='2'?'2nd':'3rd'} in a solo event. Enable "Team Event" for group games.`)
             return
           }
           taken[pos] = true
@@ -273,31 +317,35 @@ export default function App() {
       isTeamEvent: form.isTeamEvent, results,
     }
 
-    await save({ events: [...events, newEvent] })
-    resetForm()
-    setActiveTab('events')
-    setSelectedEventId(newEvent.id)
+    await save({ events: [...stateRef.current.events, newEvent] })
+    resetForm(); setActiveTab('events'); setSelectedEventId(newEvent.id)
   }
 
   async function deleteEvent(id) {
     if (!window.confirm('Delete this event?')) return
-    await save({ events: events.filter(e => e.id !== id) })
+    await save({ events: stateRef.current.events.filter(e => e.id !== id) })
     if (selectedEventId === id) setSelectedEventId(null)
   }
 
-  // ── Share ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // SHARE
+  // ─────────────────────────────────────────────────────────────────────────
+
   function shareWhatsApp() {
     const lines = ['🏅 *Summer Olympics 2026 – Friends Edition*', '━━━━━━━━━━━━━━━━━━━━━━']
     leaderboard.forEach((p, i) => {
-      const m = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i+1}.`
+      const m = i===0?'🥇':i===1?'🥈':i===2?'🥉':`${i+1}.`
       lines.push(`${m} ${p.name}  –  *${p.total} pts*  (${p.eventsPlayed} events)`)
     })
     lines.push('━━━━━━━━━━━━━━━━━━━━━━')
-    lines.push(`📊 ${events.length} events played  ·  ⭐ Best ${TOP_N} count`)
+    lines.push(`📊 ${events.length} events  ·  ⭐ Best ${TOP_N} count`)
     window.open(`https://wa.me/?text=${encodeURIComponent(lines.join('\n'))}`, '_blank')
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // MISC HELPERS
+  // ─────────────────────────────────────────────────────────────────────────
+
   const getCat    = cat => CATEGORIES.find(c => c.value === cat) || CATEGORIES[0]
   const getPlayer = id  => players.find(p => p.id === id)
   const getName   = id  => getPlayer(id)?.name || `Player ${id}`
@@ -314,17 +362,17 @@ export default function App() {
   // ══════════════════════════════════════════════════════════════════════════
   // LOADING / ERROR
   // ══════════════════════════════════════════════════════════════════════════
+
   if (loading) {
     return (
       <div className="fullscreen-center">
         <svg viewBox="0 0 144 80" className="loading-rings">
           {RINGS.map((r, i) => (
-            <circle key={i} cx={r.cx} cy={r.cy} r="18"
-              fill="none" stroke={r.color} strokeWidth="4"
-              style={{ animation: `ringPulse 1.4s ease-in-out ${i * 0.2}s infinite` }} />
+            <circle key={i} cx={r.cx} cy={r.cy} r="18" fill="none" stroke={r.color} strokeWidth="4"
+              style={{ animation: `ringPulse 1.4s ease-in-out ${i*0.2}s infinite` }} />
           ))}
         </svg>
-        <p className="loading-text">Connecting…</p>
+        <p className="loading-text">Loading…</p>
       </div>
     )
   }
@@ -339,8 +387,9 @@ export default function App() {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // LANDING PAGE
+  // LANDING
   // ══════════════════════════════════════════════════════════════════════════
+
   if (screen === 'landing') {
     return (
       <div className="landing" onClick={() => setScreen('app')}>
@@ -348,9 +397,8 @@ export default function App() {
         <div className="landing-content">
           <svg viewBox="0 0 144 80" className="landing-rings">
             {RINGS.map((r, i) => (
-              <circle key={i} cx={r.cx} cy={r.cy} r="18"
-                fill="none" stroke={r.color} strokeWidth="4"
-                className="ring-circle" style={{ animationDelay: `${i * 0.15}s` }} />
+              <circle key={i} cx={r.cx} cy={r.cy} r="18" fill="none" stroke={r.color} strokeWidth="4"
+                className="ring-circle" style={{ animationDelay: `${i*0.15}s` }} />
             ))}
           </svg>
           <h1 className="landing-title">Summer Olympics 2026</h1>
@@ -366,8 +414,6 @@ export default function App() {
   // ══════════════════════════════════════════════════════════════════════════
   return (
     <div className="app">
-
-      {/* Saving indicator */}
       {saving && <div className="saving-bar">Saving…</div>}
 
       {/* ── PIN MODAL ── */}
@@ -387,24 +433,21 @@ export default function App() {
         </div>
       )}
 
-      {/* ── LEADERBOARD DRILL-DOWN MODAL ── */}
+      {/* ── DRILL-DOWN MODAL ── */}
       {drillPlayer && (
         <div className="overlay" onClick={() => setDrillId(null)}>
           <div className="modal modal--wide" onClick={e => e.stopPropagation()}>
             <button className="modal-x" onClick={() => setDrillId(null)}>✕</button>
             <div className="drill-header">
               <div className="drill-avatar">
-                {drillPlayer.photoUrl
-                  ? <img src={drillPlayer.photoUrl} alt={drillPlayer.name} />
-                  : <span>{drillPlayer.emoji}</span>}
+                {drillPlayer.photoUrl ? <img src={drillPlayer.photoUrl} alt={drillPlayer.name} /> : <span>{drillPlayer.emoji}</span>}
               </div>
               <div>
                 <h3>{drillPlayer.name}</h3>
                 {drillPlayer.nickname && <p className="drill-nick">"{drillPlayer.nickname}"</p>}
                 <p className="drill-meta">
                   {(() => { const r = leaderboard.findIndex(p => p.id === drillId)+1; return r===1?'🥇':r===2?'🥈':r===3?'🥉':`#${r}` })()}
-                  &nbsp;·&nbsp;{drillPlayer.total} pts
-                  &nbsp;·&nbsp;{drillPlayer.eventsPlayed} events
+                  &nbsp;·&nbsp;{drillPlayer.total} pts &nbsp;·&nbsp; {drillPlayer.eventsPlayed} events
                 </p>
               </div>
             </div>
@@ -429,7 +472,7 @@ export default function App() {
                   </table>
                 </div>
               )}
-            <p className="drill-note">⭐ counts · Best {TOP_N} events used for total</p>
+            <p className="drill-note">⭐ counts · Best {TOP_N} used for total</p>
           </div>
         </div>
       )}
@@ -439,44 +482,36 @@ export default function App() {
         <div className="overlay" onClick={() => setProfileId(null)}>
           <div className="modal modal--wide" onClick={e => e.stopPropagation()}>
             <button className="modal-x" onClick={() => setProfileId(null)}>✕</button>
-
             <div className="profile-avatar-wrap">
               <div className="profile-avatar">
-                {uploadingPhoto
-                  ? <span className="upload-spinner">⏳</span>
-                  : profilePlayer.photoUrl
-                    ? <img src={profilePlayer.photoUrl} alt={profilePlayer.name} />
-                    : <span>{profilePlayer.emoji}</span>}
+                {uploadingPhoto ? <span className="upload-spinner">⏳</span>
+                  : profilePlayer.photoUrl ? <img src={profilePlayer.photoUrl} alt={profilePlayer.name} />
+                  : <span>{profilePlayer.emoji}</span>}
               </div>
               {isAdmin && (
                 <>
-                  <button className="btn btn--ghost btn--sm"
-                    disabled={uploadingPhoto}
+                  <button className="btn btn--ghost btn--sm" disabled={uploadingPhoto}
                     onClick={() => photoInputRef.current?.click()}>
                     {uploadingPhoto ? 'Uploading…' : profilePlayer.photoUrl ? '📷 Change' : '📷 Add Photo'}
                   </button>
-                  <input ref={photoInputRef} type="file" accept="image/*"
-                    style={{ display: 'none' }}
+                  <input ref={photoInputRef} type="file" accept="image/*" style={{ display: 'none' }}
                     onChange={e => handlePhotoUpload(profilePlayer.id, e)} />
                 </>
               )}
             </div>
-
             <div className="profile-name-block">
               <h3 className="profile-name">{profilePlayer.name}</h3>
-              {isAdmin ? (
-                <input className="input-inline" placeholder="Add nickname…"
-                  value={editNick}
-                  onChange={e => setEditNick(e.target.value)}
-                  onBlur={() => updatePlayer(profilePlayer.id, { nickname: editNick.trim() })} />
-              ) : profilePlayer.nickname ? (
-                <p className="profile-nick">"{profilePlayer.nickname}"</p>
-              ) : null}
+              {isAdmin
+                ? <input className="input-inline" placeholder="Add nickname…" value={editNick}
+                    onChange={e => setEditNick(e.target.value)}
+                    onBlur={() => updatePlayer(profilePlayer.id, { nickname: editNick.trim() })} />
+                : profilePlayer.nickname
+                  ? <p className="profile-nick">"{profilePlayer.nickname}"</p>
+                  : null}
             </div>
-
             <div className="profile-stats">
               {[
-                { val: profileRank === 1 ? '🥇' : profileRank === 2 ? '🥈' : profileRank === 3 ? '🥉' : `#${profileRank}`, lbl: 'Rank' },
+                { val: profileRank===1?'🥇':profileRank===2?'🥈':profileRank===3?'🥉':`#${profileRank}`, lbl: 'Rank' },
                 { val: profileLb?.total ?? 0, lbl: 'Points', gold: true },
                 { val: profileLb?.eventsPlayed ?? 0, lbl: 'Events' },
               ].map(s => (
@@ -486,21 +521,18 @@ export default function App() {
                 </div>
               ))}
             </div>
-
             <div className="profile-facts">
               <h4>⚡ Fun Facts</h4>
-              {(profilePlayer.facts || []).length === 0 && !isAdmin && (
-                <p className="muted">Nothing added yet.</p>
-              )}
+              {!(profilePlayer.facts?.length) && !isAdmin && <p className="muted">Nothing added yet.</p>}
               <ul className="facts-list">
                 {(profilePlayer.facts || []).map((fact, i) => (
                   <li key={i} className="fact-item">
                     <span>🎯 {fact}</span>
                     {isAdmin && (
                       <button className="fact-del"
-                        onClick={() => updatePlayer(profilePlayer.id, {
-                          facts: profilePlayer.facts.filter((_, j) => j !== i)
-                        })}>✕</button>
+                        onClick={() => updatePlayer(profilePlayer.id, { facts: profilePlayer.facts.filter((_,j)=>j!==i) })}>
+                        ✕
+                      </button>
                     )}
                   </li>
                 ))}
@@ -508,21 +540,19 @@ export default function App() {
               {isAdmin && (
                 <div className="fact-add">
                   <input className="input" placeholder="Add a fun fact and press Enter…"
-                    value={newFact}
-                    onChange={e => setNewFact(e.target.value)}
+                    value={newFact} onChange={e => setNewFact(e.target.value)}
                     onKeyDown={e => {
                       if (e.key === 'Enter' && newFact.trim()) {
                         updatePlayer(profilePlayer.id, { facts: [...(profilePlayer.facts||[]), newFact.trim()] })
                         setNewFact('')
                       }
                     }} />
-                  <button className="btn btn--primary btn--sm"
-                    onClick={() => {
-                      if (newFact.trim()) {
-                        updatePlayer(profilePlayer.id, { facts: [...(profilePlayer.facts||[]), newFact.trim()] })
-                        setNewFact('')
-                      }
-                    }}>Add</button>
+                  <button className="btn btn--primary btn--sm" onClick={() => {
+                    if (newFact.trim()) {
+                      updatePlayer(profilePlayer.id, { facts: [...(profilePlayer.facts||[]), newFact.trim()] })
+                      setNewFact('')
+                    }
+                  }}>Add</button>
                 </div>
               )}
             </div>
@@ -530,9 +560,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════════
-          HEADER
-      ══════════════════════════════════════════════════════════════════ */}
+      {/* ══════════════════════════════════ HEADER ══════════════════════════════════ */}
       <header className="hero">
         <svg viewBox="0 0 144 80" className="rings-svg">
           {RINGS.map((r, i) => (
@@ -577,24 +605,18 @@ export default function App() {
           ...(isAdmin ? [{ id: 'add', label: '➕ Add Event' }] : []),
           { id: 'players',     label: '👥 Players' },
         ].map(t => (
-          <button key={t.id}
-            className={`tab ${activeTab === t.id ? 'tab--active' : ''}`}
-            onClick={() => setActiveTab(t.id)}>
-            {t.label}
-          </button>
+          <button key={t.id} className={`tab ${activeTab===t.id?'tab--active':''}`}
+            onClick={() => setActiveTab(t.id)}>{t.label}</button>
         ))}
       </nav>
 
-      {/* ══════════════════════════════════════════════════════════════════
-          STANDINGS
-      ══════════════════════════════════════════════════════════════════ */}
+      {/* ══════════════════════════════════ STANDINGS ══════════════════════════════════ */}
       {activeTab === 'leaderboard' && (
         <section className="section">
           <div className="section-hd">
             <h2>Standings</h2>
             <button className="btn btn--wa btn--sm" onClick={shareWhatsApp}>📤 Share</button>
           </div>
-
           {events.length === 0 ? (
             <div className="empty-state">
               <span className="empty-icon">🏅</span>
@@ -606,36 +628,26 @@ export default function App() {
               {podium.map((player, idx) => {
                 if (!player) return <div key={idx} className="podium-slot" />
                 return (
-                  <div key={player.id}
-                    className={`podium-slot podium-slot--${podiumRanks[idx]}`}
+                  <div key={player.id} className={`podium-slot podium-slot--${podiumRanks[idx]}`}
                     onClick={() => setDrillId(player.id)}>
                     <div className="podium-avatar">
-                      {player.photoUrl
-                        ? <img src={player.photoUrl} alt={player.name} />
-                        : <span>{player.emoji}</span>}
+                      {player.photoUrl ? <img src={player.photoUrl} alt={player.name} /> : <span>{player.emoji}</span>}
                     </div>
                     <div className="podium-medal">{podiumMedals[idx]}</div>
                     <div className="podium-name">{player.name}</div>
                     <div className="podium-pts">{player.total} pts</div>
-                    <div className={`podium-block podium-block--${podiumRanks[idx]}`}>
-                      <span>{podiumRanks[idx]}</span>
-                    </div>
+                    <div className={`podium-block podium-block--${podiumRanks[idx]}`}><span>{podiumRanks[idx]}</span></div>
                   </div>
                 )
               })}
             </div>
-
             <div className="table-wrap">
               <table className="score-table">
-                <thead>
-                  <tr><th>#</th><th>Player</th><th>Total</th><th>Events</th><th>Top Scores</th></tr>
-                </thead>
+                <thead><tr><th>#</th><th>Player</th><th>Total</th><th>Events</th><th>Top Scores</th></tr></thead>
                 <tbody>
                   {leaderboard.map((p, i) => (
-                    <tr key={p.id}
-                      className={`row--click ${i < 3 ? 'row--podium' : ''}`}
-                      onClick={() => setDrillId(p.id)}>
-                      <td className="cell--rank">{i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : i+1}</td>
+                    <tr key={p.id} className={`row--click ${i<3?'row--podium':''}`} onClick={() => setDrillId(p.id)}>
+                      <td className="cell--rank">{i===0?'🥇':i===1?'🥈':i===2?'🥉':i+1}</td>
                       <td className="cell--name">
                         <div className="tbl-player">
                           <div className="tbl-avatar">
@@ -647,11 +659,8 @@ export default function App() {
                       <td className="cell--pts">{p.total}</td>
                       <td className="cell--dim">{p.eventsPlayed}</td>
                       <td className="cell--scores">
-                        {p.topBreakdown.length === 0
-                          ? <span className="muted">–</span>
-                          : p.topBreakdown.map((g, j) => (
-                              <span key={j} className={`pts-badge pts-${g.pts}`}>{g.pts}</span>
-                            ))}
+                        {p.topBreakdown.length === 0 ? <span className="muted">–</span>
+                          : p.topBreakdown.map((g,j) => <span key={j} className={`pts-badge pts-${g.pts}`}>{g.pts}</span>)}
                       </td>
                     </tr>
                   ))}
@@ -663,9 +672,7 @@ export default function App() {
         </section>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════════
-          EVENTS
-      ══════════════════════════════════════════════════════════════════ */}
+      {/* ══════════════════════════════════ EVENTS ══════════════════════════════════ */}
       {activeTab === 'events' && (
         <section className="section">
           <div className="section-hd">
@@ -674,19 +681,18 @@ export default function App() {
           </div>
           {events.length === 0 ? (
             <div className="empty-state">
-              <span className="empty-icon">🎮</span>
-              <p>No events recorded yet.</p>
+              <span className="empty-icon">🎮</span><p>No events recorded yet.</p>
               {isAdmin && <button className="btn btn--primary" onClick={() => setActiveTab('add')}>Add First Event</button>}
             </div>
           ) : (
             <div className="events-list">
               {[...events].reverse().map(ev => {
-                const cat    = getCat(ev.category)
+                const cat = getCat(ev.category)
                 const isOpen = selectedEventId === ev.id
-                const sorted = [...ev.results].sort((a, b) => getPoints(b.position) - getPoints(a.position))
+                const sorted = [...ev.results].sort((a,b) => getPoints(b.position) - getPoints(a.position))
                 return (
-                  <div key={ev.id} className={`event-card ${isOpen ? 'event-card--open' : ''}`}>
-                    <button className="event-hd" onClick={() => setSelectedEventId(isOpen ? null : ev.id)}>
+                  <div key={ev.id} className={`event-card ${isOpen?'event-card--open':''}`}>
+                    <button className="event-hd" onClick={() => setSelectedEventId(isOpen?null:ev.id)}>
                       <div className="event-left">
                         <span className="event-emoji">{cat.emoji}</span>
                         <div>
@@ -701,7 +707,7 @@ export default function App() {
                           </div>
                         </div>
                       </div>
-                      <span className="chevron">{isOpen ? '▲' : '▼'}</span>
+                      <span className="chevron">{isOpen?'▲':'▼'}</span>
                     </button>
                     {isOpen && (
                       <div className="event-body">
@@ -715,7 +721,7 @@ export default function App() {
                                     <div className="tbl-avatar sm">
                                       {getPlayer(r.playerId)?.photoUrl
                                         ? <img src={getPlayer(r.playerId).photoUrl} alt="" />
-                                        : <span>{getPlayer(r.playerId)?.emoji || '👤'}</span>}
+                                        : <span>{getPlayer(r.playerId)?.emoji||'👤'}</span>}
                                     </div>
                                     {getName(r.playerId)}
                                   </div>
@@ -728,9 +734,7 @@ export default function App() {
                         </table>
                         {isAdmin && (
                           <div className="event-footer">
-                            <button className="btn btn--danger btn--sm" onClick={() => deleteEvent(ev.id)}>
-                              🗑 Delete Event
-                            </button>
+                            <button className="btn btn--danger btn--sm" onClick={() => deleteEvent(ev.id)}>🗑 Delete Event</button>
                           </div>
                         )}
                       </div>
@@ -743,62 +747,47 @@ export default function App() {
         </section>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════════
-          ADD EVENT (admin only)
-      ══════════════════════════════════════════════════════════════════ */}
+      {/* ══════════════════════════════════ ADD EVENT ══════════════════════════════════ */}
       {activeTab === 'add' && isAdmin && (
         <section className="section">
           <h2>Add New Event</h2>
           <form className="event-form" onSubmit={handleAddEvent}>
             <div className="fg">
               <label htmlFor="ev-name">Event Name</label>
-              <input id="ev-name" type="text" className="input"
-                placeholder="e.g. Football, Quiz Night, Cards…"
-                value={form.name}
-                onChange={e => setForm(p => ({ ...p, name: e.target.value }))} required />
+              <input id="ev-name" type="text" className="input" placeholder="e.g. Football, Quiz Night…"
+                value={form.name} onChange={e => setForm(p=>({...p,name:e.target.value}))} required />
             </div>
-
             <div className="form-row">
               <div className="fg">
                 <label>Date</label>
                 <input type="date" className="input" value={form.date}
-                  onChange={e => setForm(p => ({ ...p, date: e.target.value }))} />
+                  onChange={e => setForm(p=>({...p,date:e.target.value}))} />
               </div>
               <div className="fg">
                 <label>Category</label>
                 <div className="cat-pills">
                   {CATEGORIES.map(c => (
                     <button key={c.value} type="button"
-                      className={`cat-pill ${form.category === c.value ? 'cat-pill--on' : ''}`}
-                      onClick={() => setForm(p => ({ ...p, category: c.value }))}>
+                      className={`cat-pill ${form.category===c.value?'cat-pill--on':''}`}
+                      onClick={() => setForm(p=>({...p,category:c.value}))}>
                       {c.emoji} {c.label}
                     </button>
                   ))}
                 </div>
               </div>
             </div>
-
             <div className="fg">
-              <div className="toggle-row" onClick={() => setForm(p => ({ ...p, isTeamEvent: !p.isTeamEvent }))}>
-                <div className={`toggle ${form.isTeamEvent ? 'toggle--on' : ''}`}>
-                  <div className="toggle-thumb" />
-                </div>
+              <div className="toggle-row" onClick={() => setForm(p=>({...p,isTeamEvent:!p.isTeamEvent}))}>
+                <div className={`toggle ${form.isTeamEvent?'toggle--on':''}`}><div className="toggle-thumb" /></div>
                 <div>
                   <span className="toggle-label">Team / Group Event</span>
-                  <span className="toggle-hint">
-                    {form.isTeamEvent ? 'Multiple players can share a position' : 'One player per position'}
-                  </span>
+                  <span className="toggle-hint">{form.isTeamEvent?'Multiple players can share a position':'One player per position'}</span>
                 </div>
               </div>
             </div>
-
             <div className="fg">
               <label>Player Results</label>
-              <p className="form-hint">
-                {form.isTeamEvent
-                  ? 'Assign team positions — multiple players can share a place.'
-                  : 'Only 1 player per podium place.'}
-              </p>
+              <p className="form-hint">{form.isTeamEvent?'Multiple players can share a place.':'Only 1 player per podium place.'}</p>
               <div className="player-results">
                 {players.map(p => (
                   <div key={p.id} className="pr-row">
@@ -808,19 +797,15 @@ export default function App() {
                       </div>
                       <span className="pr-name">{p.name}</span>
                     </div>
-                    <select
-                      value={form.results[p.id] ?? 'absent'}
-                      onChange={e => setForm(prev => ({ ...prev, results: { ...prev.results, [p.id]: e.target.value } }))}
-                      className={`result-sel result-sel--${form.results[p.id] ?? 'absent'}`}>
-                      {POSITION_OPTIONS.map(o => (
-                        <option key={o.value} value={o.value}>{o.label}</option>
-                      ))}
+                    <select value={form.results[p.id]??'absent'}
+                      onChange={e => setForm(prev=>({...prev,results:{...prev.results,[p.id]:e.target.value}}))}
+                      className={`result-sel result-sel--${form.results[p.id]??'absent'}`}>
+                      {POSITION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                     </select>
                   </div>
                 ))}
               </div>
             </div>
-
             <div className="form-actions">
               <button type="button" className="btn btn--ghost" onClick={resetForm}>Reset</button>
               <button type="submit" className="btn btn--primary btn--lg" disabled={saving}>
@@ -831,14 +816,12 @@ export default function App() {
         </section>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════════
-          PLAYERS
-      ══════════════════════════════════════════════════════════════════ */}
+      {/* ══════════════════════════════════ PLAYERS ══════════════════════════════════ */}
       {activeTab === 'players' && (
         <section className="section">
           <h2>Players</h2>
-          <p className="muted" style={{ marginBottom: '1.5rem' }}>
-            Click a card to view profile.{isAdmin ? ' Click the name to rename.' : ''}
+          <p className="muted" style={{marginBottom:'1.5rem'}}>
+            Click a card to view profile.{isAdmin?' Click the name to rename.':''}
           </p>
           <div className="players-grid">
             {players.map(player => {
@@ -851,36 +834,22 @@ export default function App() {
                       ? <img src={player.photoUrl} alt={player.name} className="pc-photo" />
                       : <div className="pc-emoji">{player.emoji}</div>}
                   </div>
-                  <div className="pc-rank">
-                    {rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`}
-                  </div>
-                  <div className="pc-name"
-                    onClick={e => {
-                      if (!isAdmin) return
-                      e.stopPropagation()
-                      setEditingPlayerId(player.id)
-                    }}>
+                  <div className="pc-rank">{rank===1?'🥇':rank===2?'🥈':rank===3?'🥉':`#${rank}`}</div>
+                  <div className="pc-name" onClick={e => { if(!isAdmin)return; e.stopPropagation(); setEditingPlayerId(player.id) }}>
                     {editingPlayerId === player.id ? (
-                      <input className="player-name-input"
-                        defaultValue={player.name} autoFocus
-                        onClick={e => e.stopPropagation()}
-                        onBlur={e => {
-                          if (e.target.value.trim()) updatePlayer(player.id, { name: e.target.value.trim() })
-                          setEditingPlayerId(null)
-                        }}
-                        onKeyDown={e => {
-                          if (e.key === 'Enter') e.target.blur()
-                          if (e.key === 'Escape') setEditingPlayerId(null)
-                        }} />
+                      <input className="player-name-input" defaultValue={player.name} autoFocus
+                        onClick={e=>e.stopPropagation()}
+                        onBlur={e=>{ if(e.target.value.trim()) updatePlayer(player.id,{name:e.target.value.trim()}); setEditingPlayerId(null) }}
+                        onKeyDown={e=>{ if(e.key==='Enter')e.target.blur(); if(e.key==='Escape')setEditingPlayerId(null) }} />
                     ) : (
-                      <span>{player.name}{isAdmin ? ' ✏️' : ''}</span>
+                      <span>{player.name}{isAdmin?' ✏️':''}</span>
                     )}
                   </div>
                   {player.nickname && <div className="pc-nick">"{player.nickname}"</div>}
                   <div className="pc-stats">
-                    <span className="gold fw">{lb?.total ?? 0}</span> <span className="muted">pts</span>
+                    <span className="gold fw">{lb?.total??0}</span> <span className="muted">pts</span>
                     <span className="muted"> · </span>
-                    <span className="fw">{lb?.eventsPlayed ?? 0}</span> <span className="muted">events</span>
+                    <span className="fw">{lb?.eventsPlayed??0}</span> <span className="muted">events</span>
                   </div>
                 </div>
               )
@@ -889,9 +858,7 @@ export default function App() {
         </section>
       )}
 
-      <footer className="footer">
-        <small>🏅 Summer Olympics 2026 – Friends Edition</small>
-      </footer>
+      <footer className="footer"><small>🏅 Summer Olympics 2026 – Friends Edition</small></footer>
     </div>
   )
 }
