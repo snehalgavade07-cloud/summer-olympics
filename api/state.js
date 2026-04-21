@@ -1,4 +1,16 @@
-import { createClient } from '@vercel/kv'
+import Redis from 'ioredis'
+
+// Module-level client — reused across warm Vercel invocations
+let redis
+function getRedis() {
+  if (!redis) {
+    redis = new Redis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      enableReadyCheck: false,
+    })
+  }
+  return redis
+}
 
 const PLAYER_EMOJIS = ['😎','🔥','⚡','🌟','💪','🎯','🏆','🦁','🐉']
 
@@ -12,29 +24,6 @@ const INITIAL_STATE = {
   adminPin: '2026',
 }
 
-// @vercel/kv looks for KV_REST_API_URL by default, but if the store was
-// created with a custom name Vercel prefixes the vars (e.g. MYSTORE_KV_REST_API_URL).
-// This picks whichever variant is present.
-function getKv() {
-  const url =
-    process.env.KV_REST_API_URL ??
-    Object.entries(process.env).find(([k]) => k.endsWith('_KV_REST_API_URL'))?.[1]
-
-  const token =
-    process.env.KV_REST_API_TOKEN ??
-    Object.entries(process.env).find(([k]) => k.endsWith('_KV_REST_API_TOKEN'))?.[1]
-
-  if (!url || !token) {
-    const found = Object.keys(process.env).filter(k => k.includes('KV') || k.includes('REDIS'))
-    throw new Error(
-      `KV env vars not found. Available storage vars: [${found.join(', ') || 'none'}]. ` +
-      `Make sure the Redis store is connected to this project in Vercel dashboard and you redeployed.`
-    )
-  }
-
-  return createClient({ url, token })
-}
-
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -43,22 +32,22 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end()
 
   try {
-    const kv = getKv()
+    const r = getRedis()
 
     if (req.method === 'GET') {
-      const state = await kv.get('olympics:state')
-      return res.status(200).json(state ?? INITIAL_STATE)
+      const raw = await r.get('olympics:state')
+      return res.status(200).json(raw ? JSON.parse(raw) : INITIAL_STATE)
     }
 
     if (req.method === 'POST') {
-      await kv.set('olympics:state', req.body)
+      await r.set('olympics:state', JSON.stringify(req.body))
       return res.status(200).json({ ok: true })
     }
 
     return res.status(405).end()
 
   } catch (err) {
-    console.error('[api/state]', err)
+    console.error('[api/state]', err.message)
     return res.status(500).json({ error: err.message })
   }
 }
