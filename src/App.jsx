@@ -9,7 +9,7 @@ const TOP_N       = 6
 const DEFAULT_PIN = '2026'
 const POLL_MS     = 30_000   // refresh every 30 s so all viewers stay in sync
 
-const PLAYER_EMOJIS = ['😎','🔥','⚡','🌟','💪','🎯','🏆','🦁','🐉']
+const PLAYER_EMOJIS = ['😎','🔥','⚡','🌟','💪','🎯','🏆','🦁','🐉','🦊','🐺','🦅','🌊','🎪','🚀','🎸']
 
 const INITIAL_PLAYERS = Array.from({ length: 9 }, (_, i) => ({
   id: i + 1, name: `Player ${i + 1}`,
@@ -52,7 +52,7 @@ function getPoints(position) {
 }
 
 function calcLeaderboard(players, events) {
-  return players
+  const rows = players
     .map(player => {
       const breakdown = events
         .map(ev => {
@@ -68,7 +68,13 @@ function calcLeaderboard(players, events) {
       const total = topBreakdown.reduce((s, g) => s + g.pts, 0)
       return { ...player, total, eventsPlayed: breakdown.length, topBreakdown, allBreakdown: breakdown }
     })
-    .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name))
+    .sort((a, b) => b.total - a.total)
+  let rank = 1
+  rows.forEach((p, i) => {
+    if (i > 0 && p.total < rows[i - 1].total) rank = i + 1
+    p.rank = rank
+  })
+  return rows
 }
 
 function formatDate(dateStr) {
@@ -259,6 +265,23 @@ export default function App() {
     await save({ players: updated })
   }
 
+  async function addPlayer() {
+    const current = stateRef.current.players
+    const newId = Math.max(0, ...current.map(p => p.id)) + 1
+    const newPlayer = {
+      id: newId, name: `Player ${newId}`,
+      photoUrl: null, nickname: '', facts: [],
+      emoji: PLAYER_EMOJIS[current.length % PLAYER_EMOJIS.length],
+    }
+    await save({ players: [...current, newPlayer] })
+  }
+
+  async function removePlayer(id) {
+    if (stateRef.current.players.length <= 1) return
+    if (!window.confirm('Remove this player? This cannot be undone.')) return
+    await save({ players: stateRef.current.players.filter(p => p.id !== id) })
+  }
+
   function openProfile(player) {
     setProfileId(player.id); setEditNick(player.nickname || ''); setNewFact('')
   }
@@ -362,7 +385,7 @@ export default function App() {
   const drillPlayer   = drillId   ? leaderboard.find(p => p.id === drillId)   : null
   const profilePlayer = profileId ? players.find(p => p.id === profileId)     : null
   const profileLb     = profileId ? leaderboard.find(p => p.id === profileId) : null
-  const profileRank   = profileId ? leaderboard.findIndex(p => p.id === profileId) + 1 : 0
+  const profileRank   = profileId ? (leaderboard.find(p => p.id === profileId)?.rank ?? 0) : 0
 
   const podium       = [leaderboard[1], leaderboard[0], leaderboard[2]]
   const podiumMedals = ['🥈','🥇','🥉']
@@ -642,10 +665,10 @@ export default function App() {
                     <div className="podium-avatar">
                       {player.photoUrl ? <img src={player.photoUrl} alt={player.name} /> : <span>{player.emoji}</span>}
                     </div>
-                    <div className="podium-medal">{podiumMedals[idx]}</div>
+                    <div className="podium-medal">{player.rank===1?'🥇':player.rank===2?'🥈':'🥉'}</div>
                     <div className="podium-name">{player.name}</div>
                     <div className="podium-pts">{player.total} pts</div>
-                    <div className={`podium-block podium-block--${podiumRanks[idx]}`}><span>{podiumRanks[idx]}</span></div>
+                    <div className={`podium-block podium-block--${podiumRanks[idx]}`}><span>{player.rank}</span></div>
                   </div>
                 )
               })}
@@ -654,9 +677,9 @@ export default function App() {
               <table className="score-table">
                 <thead><tr><th>#</th><th>Player</th><th>Total</th><th>Events</th><th>Top Scores</th></tr></thead>
                 <tbody>
-                  {leaderboard.map((p, i) => (
-                    <tr key={p.id} className={`row--click ${i<3?'row--podium':''}`} onClick={() => setDrillId(p.id)}>
-                      <td className="cell--rank">{i===0?'🥇':i===1?'🥈':i===2?'🥉':i+1}</td>
+                  {leaderboard.map((p) => (
+                    <tr key={p.id} className={`row--click ${p.rank<=3?'row--podium':''}`} onClick={() => setDrillId(p.id)}>
+                      <td className="cell--rank">{p.rank===1?'🥇':p.rank===2?'🥈':p.rank===3?'🥉':p.rank}</td>
                       <td className="cell--name">
                         <div className="tbl-player">
                           <div className="tbl-avatar">
@@ -838,6 +861,10 @@ export default function App() {
               const rank = leaderboard.findIndex(l => l.id === player.id) + 1
               return (
                 <div key={player.id} className="player-card" onClick={() => openProfile(player)}>
+                  {isAdmin && (
+                    <button className="pc-remove" title="Remove player"
+                      onClick={e => { e.stopPropagation(); removePlayer(player.id) }}>×</button>
+                  )}
                   <div className="pc-photo-wrap">
                     {player.photoUrl
                       ? <img src={player.photoUrl} alt={player.name} className="pc-photo" />
@@ -870,6 +897,11 @@ export default function App() {
                 </div>
               )
             })}
+            {isAdmin && (
+              <button className="add-player-card" onClick={addPlayer}>
+                <span>+</span> Add Player
+              </button>
+            )}
           </div>
         </section>
       )}
