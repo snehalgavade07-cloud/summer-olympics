@@ -182,6 +182,7 @@ export default function App() {
   const [drillId,         setDrillId]         = useState(null)
   const [profileId,       setProfileId]       = useState(null)
   const [editingPlayerId, setEditingPlayerId] = useState(null)
+  const [editingEventId,  setEditingEventId]  = useState(null)
   const [newFact,         setNewFact]         = useState('')
   const [editNick,        setEditNick]        = useState('')
   const [uploadingPhoto,  setUploadingPhoto]  = useState(false)
@@ -343,20 +344,46 @@ export default function App() {
         position: ['1','2','3'].includes(pos) ? Number(pos) : pos,
       }))
 
-    const newEvent = {
-      id: Date.now(), name: form.name.trim(),
-      date: form.date, category: form.category,
-      isTeamEvent: form.isTeamEvent, results,
+    if (editingEventId) {
+      const updated = stateRef.current.events.map(ev =>
+        ev.id === editingEventId
+          ? { ...ev, name: form.name.trim(), date: form.date, category: form.category, isTeamEvent: form.isTeamEvent, results }
+          : ev
+      )
+      await save({ events: updated })
+      setEditingEventId(null)
+      resetForm()
+      setActiveTab('events')
+      setSelectedEventId(editingEventId)
+    } else {
+      const newEvent = {
+        id: Date.now(), name: form.name.trim(),
+        date: form.date, category: form.category,
+        isTeamEvent: form.isTeamEvent, results,
+      }
+      await save({ events: [...stateRef.current.events, newEvent] })
+      resetForm(); setActiveTab('events'); setSelectedEventId(newEvent.id)
     }
-
-    await save({ events: [...stateRef.current.events, newEvent] })
-    resetForm(); setActiveTab('events'); setSelectedEventId(newEvent.id)
   }
 
   async function deleteEvent(id) {
     if (!window.confirm('Delete this event?')) return
     await save({ events: stateRef.current.events.filter(e => e.id !== id) })
     if (selectedEventId === id) setSelectedEventId(null)
+  }
+
+  function startEditEvent(ev) {
+    const resultsMap = Object.fromEntries(stateRef.current.players.map(p => [p.id, 'absent']))
+    for (const r of ev.results) resultsMap[r.playerId] = String(r.position)
+    setForm({ name: ev.name, date: ev.date, category: ev.category, isTeamEvent: !!ev.isTeamEvent, results: resultsMap })
+    setEditingEventId(ev.id)
+    setActiveTab('add')
+  }
+
+  function cancelEdit() {
+    setEditingEventId(null)
+    resetForm()
+    setActiveTab('events')
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -766,7 +793,8 @@ export default function App() {
                         </table>
                         {isAdmin && (
                           <div className="event-footer">
-                            <button className="btn btn--danger btn--sm" onClick={() => deleteEvent(ev.id)}>🗑 Delete Event</button>
+                            <button className="btn btn--ghost btn--sm" onClick={() => startEditEvent(ev)}>✏️ Edit</button>
+                            <button className="btn btn--danger btn--sm" onClick={() => deleteEvent(ev.id)}>🗑 Delete</button>
                           </div>
                         )}
                       </div>
@@ -779,10 +807,10 @@ export default function App() {
         </section>
       )}
 
-      {/* ══════════════════════════════════ ADD EVENT ══════════════════════════════════ */}
+      {/* ══════════════════════════════════ ADD / EDIT EVENT ══════════════════════════════════ */}
       {activeTab === 'add' && isAdmin && (
         <section className="section">
-          <h2>Add New Event</h2>
+          <h2>{editingEventId ? 'Edit Event' : 'Add New Event'}</h2>
           <form className="event-form" onSubmit={handleAddEvent}>
             <div className="fg">
               <label htmlFor="ev-name">Event Name</label>
@@ -839,9 +867,11 @@ export default function App() {
               </div>
             </div>
             <div className="form-actions">
-              <button type="button" className="btn btn--ghost" onClick={resetForm}>Reset</button>
+              {editingEventId
+                ? <button type="button" className="btn btn--ghost" onClick={cancelEdit}>Cancel</button>
+                : <button type="button" className="btn btn--ghost" onClick={resetForm}>Reset</button>}
               <button type="submit" className="btn btn--primary btn--lg" disabled={saving}>
-                {saving ? 'Saving…' : '🏅 Save Event'}
+                {saving ? 'Saving…' : editingEventId ? '✏️ Save Changes' : '🏅 Save Event'}
               </button>
             </div>
           </form>

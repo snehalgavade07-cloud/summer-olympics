@@ -432,7 +432,7 @@
 
 .event-body { padding: 0 1.2rem 1rem; border-top: 1px solid #14141f; }
 .event-body .results-table { margin-top: 0.75rem; }
-.event-footer { display: flex; justify-content: flex-end; margin-top: 0.75rem; }
+.event-footer { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.75rem; }
 
 /* ─────────────────────────────────────────────────────────────────────────────
    FORM
