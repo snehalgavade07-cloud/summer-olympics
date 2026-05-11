@@ -31,6 +31,18 @@ const POSITION_OPTIONS = [
   { value: '1',           label: '1st Place  (+10 pts)' },
 ]
 
+const TEAM_POSITIONS = [
+  { value: '1',           label: '🥇 1st Place  (+10 pts)' },
+  { value: '2',           label: '🥈 2nd Place  (+7 pts)' },
+  { value: '3',           label: '🥉 3rd Place  (+5 pts)' },
+  { value: 'participant', label: '✅ Participating  (+2 pts)' },
+]
+
+const DEFAULT_TEAMS = [
+  { id: 1, name: 'Team 1', position: '1' },
+  { id: 2, name: 'Team 2', position: '2' },
+]
+
 const RINGS = [
   { color: '#0081C8', cx: 30, cy: 30 },
   { color: '#b0b8c8', cx: 72, cy: 30 },
@@ -192,6 +204,9 @@ export default function App() {
     name: '', date: new Date().toISOString().split('T')[0],
     category: 'sports', isTeamEvent: false,
     results: Object.fromEntries(INITIAL_PLAYERS.map(p => [p.id, 'absent'])),
+    isTeamGame: false,
+    teams: DEFAULT_TEAMS,
+    teamAssignments: Object.fromEntries(INITIAL_PLAYERS.map(p => [p.id, 'absent'])),
   })
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -313,10 +328,14 @@ export default function App() {
   // ─────────────────────────────────────────────────────────────────────────
 
   function resetForm() {
+    const ps = stateRef.current.players
     setForm({
       name: '', date: new Date().toISOString().split('T')[0],
       category: 'sports', isTeamEvent: false,
-      results: Object.fromEntries(stateRef.current.players.map(p => [p.id, 'absent'])),
+      results: Object.fromEntries(ps.map(p => [p.id, 'absent'])),
+      isTeamGame: false,
+      teams: DEFAULT_TEAMS,
+      teamAssignments: Object.fromEntries(ps.map(p => [p.id, 'absent'])),
     })
   }
 
@@ -324,46 +343,58 @@ export default function App() {
     e.preventDefault()
     if (!form.name.trim()) return
 
-    if (!form.isTeamEvent) {
-      const taken = {}
-      for (const [, pos] of Object.entries(form.results)) {
-        if (['1','2','3'].includes(pos)) {
-          if (taken[pos]) {
-            alert(`Two players can't share ${pos==='1'?'1st':pos==='2'?'2nd':'3rd'} in a solo event. Enable "Team Event" for group games.`)
-            return
+    let results, extraFields = {}
+
+    if (form.isTeamGame) {
+      const savedTeams = form.teams.map(t => ({
+        id: t.id, name: t.name || `Team ${t.id}`, position: t.position,
+        playerIds: Object.entries(form.teamAssignments)
+          .filter(([, tid]) => tid === String(t.id))
+          .map(([pid]) => Number(pid)),
+      }))
+      results = savedTeams.flatMap(t =>
+        t.playerIds.map(pid => ({
+          playerId: pid,
+          position: ['1','2','3'].includes(t.position) ? Number(t.position) : t.position,
+        }))
+      )
+      extraFields = { isTeamGame: true, isTeamEvent: false, teams: savedTeams }
+    } else {
+      if (!form.isTeamEvent) {
+        const taken = {}
+        for (const [, pos] of Object.entries(form.results)) {
+          if (['1','2','3'].includes(pos)) {
+            if (taken[pos]) {
+              alert(`Two players can't share ${pos==='1'?'1st':pos==='2'?'2nd':'3rd'} in a solo event. Enable "Team Event" for group games.`)
+              return
+            }
+            taken[pos] = true
           }
-          taken[pos] = true
         }
       }
+      results = Object.entries(form.results)
+        .filter(([, pos]) => pos !== 'absent')
+        .map(([pid, pos]) => ({
+          playerId: Number(pid),
+          position: ['1','2','3'].includes(pos) ? Number(pos) : pos,
+        }))
+      extraFields = { isTeamGame: false, isTeamEvent: form.isTeamEvent }
     }
 
-    const results = Object.entries(form.results)
-      .filter(([, pos]) => pos !== 'absent')
-      .map(([pid, pos]) => ({
-        playerId: Number(pid),
-        position: ['1','2','3'].includes(pos) ? Number(pos) : pos,
-      }))
+    const targetId = editingEventId || Date.now()
+    const eventData = {
+      id: targetId, name: form.name.trim(),
+      date: form.date, category: form.category,
+      ...extraFields, results,
+    }
 
     if (editingEventId) {
-      const updated = stateRef.current.events.map(ev =>
-        ev.id === editingEventId
-          ? { ...ev, name: form.name.trim(), date: form.date, category: form.category, isTeamEvent: form.isTeamEvent, results }
-          : ev
-      )
-      await save({ events: updated })
+      await save({ events: stateRef.current.events.map(ev => ev.id === editingEventId ? eventData : ev) })
       setEditingEventId(null)
-      resetForm()
-      setActiveTab('events')
-      setSelectedEventId(editingEventId)
     } else {
-      const newEvent = {
-        id: Date.now(), name: form.name.trim(),
-        date: form.date, category: form.category,
-        isTeamEvent: form.isTeamEvent, results,
-      }
-      await save({ events: [...stateRef.current.events, newEvent] })
-      resetForm(); setActiveTab('events'); setSelectedEventId(newEvent.id)
+      await save({ events: [...stateRef.current.events, eventData] })
     }
+    resetForm(); setActiveTab('events'); setSelectedEventId(targetId)
   }
 
   async function deleteEvent(id) {
@@ -373,9 +404,28 @@ export default function App() {
   }
 
   function startEditEvent(ev) {
-    const resultsMap = Object.fromEntries(stateRef.current.players.map(p => [p.id, 'absent']))
-    for (const r of ev.results) resultsMap[r.playerId] = String(r.position)
-    setForm({ name: ev.name, date: ev.date, category: ev.category, isTeamEvent: !!ev.isTeamEvent, results: resultsMap })
+    const ps = stateRef.current.players
+    if (ev.isTeamGame && ev.teams) {
+      const assignments = Object.fromEntries(ps.map(p => [p.id, 'absent']))
+      for (const team of ev.teams)
+        for (const pid of (team.playerIds || [])) assignments[pid] = String(team.id)
+      setForm({
+        name: ev.name, date: ev.date, category: ev.category,
+        isTeamEvent: false, results: {},
+        isTeamGame: true,
+        teams: ev.teams.map(t => ({ id: t.id, name: t.name, position: String(t.position) })),
+        teamAssignments: assignments,
+      })
+    } else {
+      const resultsMap = Object.fromEntries(ps.map(p => [p.id, 'absent']))
+      for (const r of ev.results) resultsMap[r.playerId] = String(r.position)
+      setForm({
+        name: ev.name, date: ev.date, category: ev.category,
+        isTeamEvent: !!ev.isTeamEvent, results: resultsMap,
+        isTeamGame: false, teams: DEFAULT_TEAMS,
+        teamAssignments: Object.fromEntries(ps.map(p => [p.id, 'absent'])),
+      })
+    }
     setEditingEventId(ev.id)
     setActiveTab('add')
   }
@@ -757,7 +807,8 @@ export default function App() {
                         <div>
                           <div className="event-title">
                             {ev.name}
-                            {ev.isTeamEvent && <span className="team-tag">👥 Team</span>}
+                            {ev.isTeamGame && <span className="team-tag">👥 Teams</span>}
+                            {!ev.isTeamGame && ev.isTeamEvent && <span className="team-tag">👥 Shared</span>}
                           </div>
                           <div className="event-meta">
                             <span className="event-date">{formatDate(ev.date)}</span>
@@ -770,27 +821,59 @@ export default function App() {
                     </button>
                     {isOpen && (
                       <div className="event-body">
-                        <table className="results-table">
-                          <thead><tr><th>Player</th><th>Result</th><th>Points</th></tr></thead>
-                          <tbody>
-                            {sorted.map(r => (
-                              <tr key={r.playerId}>
-                                <td>
-                                  <div className="tbl-player">
-                                    <div className="tbl-avatar sm">
-                                      {getPlayer(r.playerId)?.photoUrl
-                                        ? <img src={getPlayer(r.playerId).photoUrl} alt="" />
-                                        : <span>{getPlayer(r.playerId)?.emoji||'👤'}</span>}
+                        {ev.isTeamGame && ev.teams ? (
+                          <div className="team-results">
+                            {[...ev.teams]
+                              .sort((a,b) => getPoints(b.position) - getPoints(a.position))
+                              .map(team => {
+                                const pts = getPoints(team.position)
+                                const medal = team.position==='1'||team.position===1?'🥇':team.position==='2'||team.position===2?'🥈':team.position==='3'||team.position===3?'🥉':'✅'
+                                const members = (team.playerIds||[]).map(pid=>getPlayer(pid)).filter(Boolean)
+                                return (
+                                  <div key={team.id} className="team-result-card">
+                                    <div className="team-result-hd">
+                                      <span className="team-result-medal">{medal}</span>
+                                      <span className="team-result-name">{team.name}</span>
+                                      <span className="team-result-pts">+{pts} pts each</span>
                                     </div>
-                                    {getName(r.playerId)}
+                                    <div className="team-members">
+                                      {members.map(player => (
+                                        <div key={player.id} className="team-member">
+                                          <div className="tbl-avatar sm">
+                                            {player.photoUrl?<img src={player.photoUrl} alt=""/>:<span>{player.emoji}</span>}
+                                          </div>
+                                          <span>{player.name}</span>
+                                        </div>
+                                      ))}
+                                      {members.length === 0 && <span className="muted" style={{fontSize:'0.8rem'}}>No players</span>}
+                                    </div>
                                   </div>
-                                </td>
-                                <td>{posLabel(r.position)}</td>
-                                <td className="cell--pts">+{getPoints(r.position)}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                                )
+                              })}
+                          </div>
+                        ) : (
+                          <table className="results-table">
+                            <thead><tr><th>Player</th><th>Result</th><th>Points</th></tr></thead>
+                            <tbody>
+                              {sorted.map(r => (
+                                <tr key={r.playerId}>
+                                  <td>
+                                    <div className="tbl-player">
+                                      <div className="tbl-avatar sm">
+                                        {getPlayer(r.playerId)?.photoUrl
+                                          ? <img src={getPlayer(r.playerId).photoUrl} alt="" />
+                                          : <span>{getPlayer(r.playerId)?.emoji||'👤'}</span>}
+                                      </div>
+                                      {getName(r.playerId)}
+                                    </div>
+                                  </td>
+                                  <td>{posLabel(r.position)}</td>
+                                  <td className="cell--pts">+{getPoints(r.position)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
                         {isAdmin && (
                           <div className="event-footer">
                             <button className="btn btn--ghost btn--sm" onClick={() => startEditEvent(ev)}>✏️ Edit</button>
@@ -836,36 +919,117 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {/* ── Event type ── */}
             <div className="fg">
-              <div className="toggle-row" onClick={() => setForm(p=>({...p,isTeamEvent:!p.isTeamEvent}))}>
-                <div className={`toggle ${form.isTeamEvent?'toggle--on':''}`}><div className="toggle-thumb" /></div>
-                <div>
-                  <span className="toggle-label">Team / Group Event</span>
-                  <span className="toggle-hint">{form.isTeamEvent?'Multiple players can share a position':'One player per position'}</span>
+              <label>Event Type</label>
+              <div className="event-type-pills">
+                <button type="button"
+                  className={`event-type-pill ${!form.isTeamGame?'event-type-pill--on':''}`}
+                  onClick={() => setForm(p=>({...p,isTeamGame:false}))}>
+                  👤 Individual
+                </button>
+                <button type="button"
+                  className={`event-type-pill ${form.isTeamGame?'event-type-pill--on':''}`}
+                  onClick={() => setForm(p=>({...p,isTeamGame:true}))}>
+                  👥 Team Game
+                </button>
+              </div>
+            </div>
+
+            {form.isTeamGame ? (<>
+              {/* ── Team builder ── */}
+              <div className="fg">
+                <label>Teams</label>
+                <div className="teams-builder">
+                  {form.teams.map(team => (
+                    <div key={team.id} className="team-builder-row">
+                      <input className="input team-name-input" placeholder="Team name"
+                        value={team.name}
+                        onChange={e => setForm(p=>({...p, teams: p.teams.map(t => t.id===team.id?{...t,name:e.target.value}:t)}))} />
+                      <select className="input team-pos-select"
+                        value={team.position}
+                        onChange={e => setForm(p=>({...p, teams: p.teams.map(t => t.id===team.id?{...t,position:e.target.value}:t)}))}
+                      >
+                        {TEAM_POSITIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                      </select>
+                      {form.teams.length > 1 && (
+                        <button type="button" className="team-remove-btn"
+                          onClick={() => setForm(p=>({
+                            ...p,
+                            teams: p.teams.filter(t=>t.id!==team.id),
+                            teamAssignments: Object.fromEntries(
+                              Object.entries(p.teamAssignments).map(([pid,tid])=>[pid, tid===String(team.id)?'absent':tid])
+                            ),
+                          }))}>×</button>
+                      )}
+                    </div>
+                  ))}
+                  <button type="button" className="btn btn--ghost btn--sm"
+                    onClick={() => {
+                      const newId = Math.max(0, ...form.teams.map(t=>t.id)) + 1
+                      setForm(p=>({...p, teams: [...p.teams, {id:newId, name:`Team ${newId}`, position:'participant'}]}))
+                    }}>+ Add Team</button>
                 </div>
               </div>
-            </div>
-            <div className="fg">
-              <label>Player Results</label>
-              <p className="form-hint">{form.isTeamEvent?'Multiple players can share a place.':'Only 1 player per podium place.'}</p>
-              <div className="player-results">
-                {players.map(p => (
-                  <div key={p.id} className="pr-row">
-                    <div className="pr-info">
-                      <div className="pr-avatar">
-                        {p.photoUrl ? <img src={p.photoUrl} alt="" /> : <span>{p.emoji}</span>}
+
+              {/* ── Player assignment ── */}
+              <div className="fg">
+                <label>Assign Players</label>
+                <div className="player-results">
+                  {players.map(p => (
+                    <div key={p.id} className="pr-row">
+                      <div className="pr-info">
+                        <div className="pr-avatar">
+                          {p.photoUrl ? <img src={p.photoUrl} alt="" /> : <span>{p.emoji}</span>}
+                        </div>
+                        <span className="pr-name">{p.name}</span>
                       </div>
-                      <span className="pr-name">{p.name}</span>
+                      <select
+                        value={form.teamAssignments[p.id]??'absent'}
+                        onChange={e => setForm(prev=>({...prev, teamAssignments:{...prev.teamAssignments,[p.id]:e.target.value}}))}
+                        className={`result-sel ${form.teamAssignments[p.id]==='absent'||!form.teamAssignments[p.id]?'result-sel--absent':'result-sel--1'}`}>
+                        <option value="absent">— Not Playing</option>
+                        {form.teams.map(t => <option key={t.id} value={String(t.id)}>{t.name}</option>)}
+                      </select>
                     </div>
-                    <select value={form.results[p.id]??'absent'}
-                      onChange={e => setForm(prev=>({...prev,results:{...prev.results,[p.id]:e.target.value}}))}
-                      className={`result-sel result-sel--${form.results[p.id]??'absent'}`}>
-                      {POSITION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                    </select>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
-            </div>
+            </>) : (<>
+              {/* ── Individual event ── */}
+              <div className="fg">
+                <div className="toggle-row" onClick={() => setForm(p=>({...p,isTeamEvent:!p.isTeamEvent}))}>
+                  <div className={`toggle ${form.isTeamEvent?'toggle--on':''}`}><div className="toggle-thumb" /></div>
+                  <div>
+                    <span className="toggle-label">Shared Positions</span>
+                    <span className="toggle-hint">{form.isTeamEvent?'Multiple players can share a position':'One player per position'}</span>
+                  </div>
+                </div>
+              </div>
+              <div className="fg">
+                <label>Player Results</label>
+                <p className="form-hint">{form.isTeamEvent?'Multiple players can share a place.':'Only 1 player per podium place.'}</p>
+                <div className="player-results">
+                  {players.map(p => (
+                    <div key={p.id} className="pr-row">
+                      <div className="pr-info">
+                        <div className="pr-avatar">
+                          {p.photoUrl ? <img src={p.photoUrl} alt="" /> : <span>{p.emoji}</span>}
+                        </div>
+                        <span className="pr-name">{p.name}</span>
+                      </div>
+                      <select value={form.results[p.id]??'absent'}
+                        onChange={e => setForm(prev=>({...prev,results:{...prev.results,[p.id]:e.target.value}}))}
+                        className={`result-sel result-sel--${form.results[p.id]??'absent'}`}>
+                        {POSITION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>)}
+
             <div className="form-actions">
               {editingEventId
                 ? <button type="button" className="btn btn--ghost" onClick={cancelEdit}>Cancel</button>
